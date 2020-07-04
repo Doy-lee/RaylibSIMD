@@ -514,63 +514,130 @@ void RaylibSIMD_ImageDrawRectangleRec(Image *dst, Rectangle rec, Color color)
     // Security check to avoid program crash
     if ((dst->data == NULL) || (dst->width == 0) || (dst->height == 0)) return;
 
-    if (dst->format == UNCOMPRESSED_R8G8B8A8 || dst->format == UNCOMPRESSED_R8G8B8)
+    // TODO(doyle): Grayscale, Gray Alpha, R5G6B5, R5G5B5A1, R4G4B4A4 haven't
+    // been tested yet but, I wrote this function to technically be agnostic of
+    // the storage format. It probably works but should be checked.
+
+    __m128i color_4x = {0};
+    switch(dst->format)
     {
-        Rectangle dst_rect = (Rectangle){0, 0, dst->width, dst->height};
-        rec                = RaylibSIMD__RectangleIntersection(dst_rect, rec);
+        default: break;
+        case UNCOMPRESSED_GRAYSCALE:
+        {
+            float r01 = RS_CAST(float) color.r / 255.0f;
+            float g01 = RS_CAST(float) color.g / 255.0f;
+            float b01 = RS_CAST(float) color.b / 255.0f;
 
-        int const bits_per_pixel        = RaylibSIMD__FormatToBitsPerPixel(dst->format);
-        int const bytes_per_pixel       = bits_per_pixel / 8;
+            unsigned char gray = RS_CAST(unsigned char)((r01 * 0.299f + g01 * 0.587f + b01 * 0.114f) * 255.0f);
+            color_4x           = _mm_set1_epi8(gray);
+        } break;
 
-        int const pixels_per_simd_write = sizeof(__m128i) / bytes_per_pixel;
-        int const bytes_per_simd_write  = pixels_per_simd_write * bytes_per_pixel;
+        case UNCOMPRESSED_GRAY_ALPHA:
+        {
+            float r01 = RS_CAST(float) color.r / 255.0f;
+            float g01 = RS_CAST(float) color.g / 255.0f;
+            float b01 = RS_CAST(float) color.b / 255.0f;
+            unsigned char gray           = RS_CAST(unsigned char)((r01 * 0.299f + g01 * 0.587f + b01 * 0.114f) * 255.0f);
+            color_4x = _mm_setr_epi8(gray, color.a,
+                                     gray, color.a,
+                                     gray, color.a,
+                                     gray, color.a,
+                                     gray, color.a,
+                                     gray, color.a,
+                                     gray, color.a,
+                                     gray, color.a);
 
-        int const simd_iterations       = RS_CAST(int)(rec.width * bytes_per_pixel) / sizeof(__m128i);
-        int const remaining_iterations  = rec.width - (pixels_per_simd_write * simd_iterations);
+        } break;
 
-        int const stride                = dst->width * bytes_per_pixel;
-        int const row_offset            = (rec.y * stride) + rec.x * bytes_per_pixel;
-
-        __m128i color_u32_4x = {0};
-        if (dst->format == UNCOMPRESSED_R8G8B8A8)
+        case UNCOMPRESSED_R8G8B8A8:
         {
             uint32_t color_u32 = RaylibSIMD__ColorToU32(color);
-            color_u32_4x       = _mm_set1_epi32(color_u32);
+            color_4x           = _mm_set1_epi32(color_u32);
         }
-        else
+        break;
+
+        case UNCOMPRESSED_R8G8B8:
         {
             char r = RS_CAST(char)color.r;
             char g = RS_CAST(char)color.g;
             char b = RS_CAST(char)color.b;
-            color_u32_4x = _mm_setr_epi8(r, g, b,
-                                         r, g, b,
-                                         r, g, b,
-                                         r, g, b,
-                                         r, g, b,
-                                         r);
+            color_4x = _mm_setr_epi8(r, g, b,
+                                     r, g, b,
+                                     r, g, b,
+                                     r, g, b,
+                                     r, g, b,
+                                     r);
         }
+        break;
 
-        for (int y = 0; y < RS_CAST(int)rec.height; y++)
+        case UNCOMPRESSED_R5G6B5:
+        case UNCOMPRESSED_R5G5B5A1:
+        case UNCOMPRESSED_R4G4B4A4:
         {
-            unsigned char *dest = RS_CAST(unsigned char *)dst->data + (row_offset + (stride * y));
-            for (int iteration = 0; iteration < simd_iterations; iteration++)
+            float r01 = RS_CAST(float) color.r / 255.0f;
+            float g01 = RS_CAST(float) color.g / 255.0f;
+            float b01 = RS_CAST(float) color.b / 255.0f;
+            float a01 = RS_CAST(float) color.a / 255.0f;
+
+            uint16_t rgba = 0;
+            if (dst->format == UNCOMPRESSED_R5G6B5)
             {
-                _mm_storeu_si128(RS_CAST(__m128i *)dest, color_u32_4x);
-                dest += bytes_per_simd_write;
+                char r = RS_CAST(char)(r01 * 31.f);
+                char g = RS_CAST(char)(g01 * 63.f);
+                char b = RS_CAST(char)(b01 * 31.f);
+                rgba   = r << 11 | g << 5 | b << 0;
+            }
+            else if (dst->format == UNCOMPRESSED_R5G5B5A1)
+            {
+                char r = RS_CAST(char)(r01 * 31.f);
+                char g = RS_CAST(char)(g01 * 31.f);
+                char b = RS_CAST(char)(b01 * 31.f);
+                char a = RS_CAST(char)(a01 * 31.f);
+                rgba   = r << 11 | g << 6 | b << 1 | a << 0;
+            }
+            else if (dst->format == UNCOMPRESSED_R4G4B4A4)
+            {
+                char r = RS_CAST(char)(r01 * 15.f);
+                char g = RS_CAST(char)(g01 * 15.f);
+                char b = RS_CAST(char)(b01 * 15.f);
+                char a = RS_CAST(char)(a01 * 15.f);
+                rgba   = r << 12 | g << 8 | b << 4 | a << 0;
             }
 
-            for (int iteration = 0; iteration < remaining_iterations; iteration++)
-            {
-                SetPixelColor(dest, color, dst->format);
-                dest += bytes_per_pixel;
-            }
+            color_4x = _mm_set1_epi32((rgba << 0) | (rgba << 16));
         }
+        break;
     }
-    else
+
+    Rectangle dst_rect = (Rectangle){0, 0, dst->width, dst->height};
+    rec                = RaylibSIMD__RectangleIntersection(dst_rect, rec);
+
+    int const bits_per_pixel        = RaylibSIMD__FormatToBitsPerPixel(dst->format);
+    int const bytes_per_pixel       = bits_per_pixel / 8;
+
+    int const pixels_per_simd_write = sizeof(__m128i) / bytes_per_pixel;
+    int const bytes_per_simd_write  = pixels_per_simd_write * bytes_per_pixel;
+
+    int const simd_iterations       = RS_CAST(int)(rec.width * bytes_per_pixel) / sizeof(__m128i);
+    int const remaining_iterations  = rec.width - (pixels_per_simd_write * simd_iterations);
+
+    int const stride                = dst->width * bytes_per_pixel;
+    int const row_offset            = (rec.y * stride) + rec.x * bytes_per_pixel;
+
+    for (int y = 0; y < RS_CAST(int)rec.height; y++)
     {
-        Image imRec = RaylibSIMD_GenImageColor((int)rec.width, (int)rec.height, color);
-        RaylibSIMD_ImageDraw(dst, imRec, (Rectangle){0.f, 0.f, RS_CAST(float)rec.width, RS_CAST(float)rec.height}, rec, WHITE);
-        UnloadImage(imRec);
+        unsigned char *dest = RS_CAST(unsigned char *)dst->data + (row_offset + (stride * y));
+        for (int iteration = 0; iteration < simd_iterations; iteration++)
+        {
+            _mm_storeu_si128(RS_CAST(__m128i *)dest, color_4x);
+            dest += bytes_per_simd_write;
+        }
+
+        for (int iteration = 0; iteration < remaining_iterations; iteration++)
+        {
+            SetPixelColor(dest, color, dst->format);
+            dest += bytes_per_pixel;
+        }
     }
 }
 
