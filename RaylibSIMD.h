@@ -35,10 +35,20 @@ RLAPI void  RaylibSIMD_ImageClearBackground (Image *dst, Color color);
     #error "SIMD Implementation Required"
 #endif
 
+#define RS_FILE_SCOPE static
 #define RS_MAX(a, b) ((a) > (b) ? (a) : (b))
 #define RS_CAST(x) (x)
 
-void RaylibSIMD__SoftwareBlendPixel(unsigned char const *src_ptr, unsigned char *dest_ptr, Color tint, float src_alpha_min)
+RS_FILE_SCOPE uint32_t RaylibSIMD__ColorToU32(Color color)
+{
+    uint32_t result = (RS_CAST(uint32_t) color.r << 0) |
+                      (RS_CAST(uint32_t) color.g << 8) |
+                      (RS_CAST(uint32_t) color.b << 16) |
+                      (RS_CAST(uint32_t) color.a << 24);
+    return result;
+}
+
+RS_FILE_SCOPE void RaylibSIMD__SoftwareBlendPixel(unsigned char const *src_ptr, unsigned char *dest_ptr, Color tint, float src_alpha_min)
 {
     float const INV_255 = 1.f / 255.f;
     uint32_t src_pixel  = *RS_CAST(uint32_t *)src_ptr;
@@ -434,13 +444,13 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
 
 Image RaylibSIMD_GenImageColor(int width, int height, Color color)
 {
-    Color *pixels            = (Color *)RL_CALLOC(width*height, sizeof(Color));
+    Color *pixels            = RS_CAST(Color *)RL_CALLOC(width*height, sizeof(Color));
     int num_pixels           = width * height;
     int simd_iterations      = num_pixels / 4;
     int remaining_iterations = num_pixels % 4;
 
     __m128i *dest_4x     = RS_CAST(__m128i *) pixels;
-    uint32_t color_u32   = (RS_CAST(uint32_t)color.r << 0) | (RS_CAST(uint32_t)color.g << 8) | (RS_CAST(uint32_t)color.b << 16) | (RS_CAST(uint32_t)color.a << 24);
+    uint32_t color_u32   = RaylibSIMD__ColorToU32(color);
     __m128i color_u32_4x = _mm_set1_epi32(color_u32);
     for (int i = 0; i < simd_iterations; i++)
     {
