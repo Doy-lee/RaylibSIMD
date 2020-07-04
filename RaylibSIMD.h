@@ -284,26 +284,33 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
                 if (srcPtr->format == UNCOMPRESSED_R8G8B8)
                 {
                     // NOTE: We load 4 pixels x 4 colors at a time. But if the
-                    // source image is 3BPP, then the 4th color loaded in each
+                    // source image is RGB, then the 4th color loaded in each
                     // pixel is going to be the RED component of the next pixel.
                     //
                     // Pixels[] = {RGB, RGB, RGB, RGB, ...}
                     //
-                    // For example, naively loading the next 4 color components
-                    // in a 3BPP byte stream, produces
+                    // For example, naively loading the next pixels in a 3BPP
+                    // byte stream, produces in a 128 bit SIMD register
                     //
-                    // RGBR GBRG BRGB
+                    // Pixel | 1    2    3    4
+                    // Color | RGBR GBRG BRGB RGBR
+                    //            ^
+                    //            |
+                    //            +---- This is the 2nd pixel's Red Component
                     //
-                    // The subsequent pixel needs to re-load the red channel
-                    // to correctly pull the RGB components out and so forth for
+                    // The subsequent pixels needs to shift the color channels
+                    // to correctly set up the RGB components and so forth for
                     // subsequent pixels.
                     //
-                    // RGBR RGBR RGBR
+                    // Pixel | 1    2    3    4
+                    // Color | RGBR RGBR RGBR RGBR
                     //
-                    // We do this by shuffling the loaded pixels into place. In
-                    // the 4BPP case, we do a no-op shuffle that preserves
-                    // positions of all color components to avoid branches in
-                    // the blitting hot path.
+                    // We do this by shuffling the loaded bits into place
+                    // duplicating the red channel and copying onwards. In the
+                    // RGBA case, we do a no-op shuffle that preserves positions
+                    // of all color components to avoid branches in the blitting
+                    // hot path.
+                    //
                     src_alpha_min      = 255.f;
                     src_pixels_shuffle = _mm_set_epi8(12, 11, 10, 9, 9, 8, 7, 6, 6, 5, 4, 3, 3, 2, 1, 0);
                 }
@@ -333,7 +340,7 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
                         dest_ptr += (SIMD_WIDTH * bytesPerPixelDst);
 
                         // NOTE: Unpack Source & Dest Pixel Layout for SIMD
-                        // From {RGBA0, RGBA1, RGBA2, RGBA3} to {RRRR} {GGGG} {BBBB} {AAAA} where each
+                        // From {ABGR1, ABGR2, ABGR3, ABGR3} to {RRRR} {GGGG} {BBBB} {AAAA} where each
                         // new {...} is one SIMD register with u32x4 lanes of the same color component.
                         //
                         //    1. Shift colour component to lowest 8 bits
@@ -407,14 +414,15 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
                         __m128i blended0123_b_int = _mm_cvtps_epi32(blend0123_b);
 
                         // NOTE: Repack The Pixel
-                        // From {RRRR} {GGGG} {BBBB} {AAAA} to {RGBA RGBA RGBA RGBA}
-                        // i.e. blended0123_r_int = {[0,0,0,R], [0,0,0,R], [0,0,0,R], [0,0,0,R]}
-                        //      blended0123_g_int = {[0,0,0,G], [0,0,0,G], [0,0,0,G], [0,0,0,G]}
-                        //      ....
-                        //
-                        // Each blend has the color component converted to 8 bits sitting in the low bits of the register.
+                        // From {RRRR} {GGGG} {BBBB} {AAAA} to {ABGR ABGR ABGR ABGR}
+                        // Each blend has the color component converted to 8 bits sitting in the low bits of the SIMD lane.
                         // Shift the colors into place and or them together to get the final output
-                        //      pixel0123 = {[R,G,B,A], [R,G,B,A], [R,G,B,A], [R,G,B,A]}
+                        //
+                        //      blended0123_r_int = {[0,0,0,R], [0,0,0,R], [0,0,0,R], [0,0,0,R]}
+                        //      blended0123_g_int = {[0,0,0,G], [0,0,0,G], [0,0,0,G], [0,0,0,G]}
+                        //      blended0123_b_int = {[0,0,0,B], [0,0,0,B], [0,0,0,B], [0,0,0,B]}
+                        //      blended0123_b_int = {[0,0,0,A], [0,0,0,A], [0,0,0,A], [0,0,0,A]}
+                        //      pixel0123         = {[A,B,G,R], [A,B,G,R], [A,B,G,R], [A,B,G,R]}
                         //
                         __m128i pixel0123 =
                             _mm_or_si128(blended0123_r_int,
