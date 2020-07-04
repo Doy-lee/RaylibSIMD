@@ -444,47 +444,14 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
 
 Image RaylibSIMD_GenImageColor(int width, int height, Color color)
 {
-    Color *pixels            = RS_CAST(Color *)RL_CALLOC(width*height, sizeof(Color));
-    int num_pixels           = width * height;
-    int simd_iterations      = num_pixels / 4;
-    int remaining_iterations = num_pixels % 4;
-
-    __m128i *dest_4x     = RS_CAST(__m128i *) pixels;
-    uint32_t color_u32   = RaylibSIMD__ColorToU32(color);
-    __m128i color_u32_4x = _mm_set1_epi32(color_u32);
-    for (int i = 0; i < simd_iterations; i++)
-    {
-        _mm_store_si128(dest_4x, color_u32_4x);
-        dest_4x++;
-    }
-
-    uint32_t *dest = RS_CAST(uint32_t *)dest_4x;
-    for (int i = 0; i < remaining_iterations; i++)
-        *dest++ = color_u32;
-
     Image image   = {0};
-    image.data    = pixels;
+    image.data    = RS_CAST(Color *) RL_MALLOC(width * height * sizeof(Color));
     image.width   = width;
     image.height  = height;
     image.format  = UNCOMPRESSED_R8G8B8A8;
     image.mipmaps = 1;
+    RaylibSIMD_ImageDrawRectangleRec(&image, (Rectangle){0, 0, width, height}, color);
     return image;
-}
-
-// Draw rectangle within an image
-void RaylibSIMD_ImageDrawRectangleRec(Image *dst, Rectangle rec, Color color)
-{
-    // Security check to avoid program crash
-    if ((dst->data == NULL) || (dst->width == 0) || (dst->height == 0)) return;
-
-    Image imRec = RaylibSIMD_GenImageColor((int)rec.width, (int)rec.height, color);
-    RaylibSIMD_ImageDraw(dst, imRec, (Rectangle){0.f, 0.f, RS_CAST(float)rec.width, RS_CAST(float)rec.height}, rec, WHITE);
-    UnloadImage(imRec);
-}
-
-void RaylibSIMD_ImageDrawRectangle(Image *dst, int posX, int posY, int width, int height, Color color)
-{
-    RaylibSIMD_ImageDrawRectangleRec(dst, (Rectangle){RS_CAST(float)posX, RS_CAST(float)posY, RS_CAST(float)width, RS_CAST(float)height}, color);
 }
 
 RS_FILE_SCOPE int RaylibSIMD__FormatToBitsPerPixel(int format)
@@ -519,36 +486,56 @@ RS_FILE_SCOPE int RaylibSIMD__FormatToBitsPerPixel(int format)
     return result;
 }
 
-void RaylibSIMD_ImageClearBackground(Image *dst, Color color)
+// Draw rectangle within an image
+void RaylibSIMD_ImageDrawRectangleRec(Image *dst, Rectangle rec, Color color)
 {
+    // Security check to avoid program crash
+    if ((dst->data == NULL) || (dst->width == 0) || (dst->height == 0)) return;
+
     if (dst->format == UNCOMPRESSED_R8G8B8A8)
     {
         int bits_per_pixel  = RaylibSIMD__FormatToBitsPerPixel(dst->format);
         int bytes_per_pixel = bits_per_pixel / 8;
         int total_pixels    = dst->width * dst->height;
 
-        int const SIMD_WIDTH = 4;
-        int simd_iterations      = total_pixels / SIMD_WIDTH;
-        int remaining_iterations = total_pixels % SIMD_WIDTH;
+        int const SIMD_WIDTH     = 4;
+        int simd_iterations      = dst->width / SIMD_WIDTH;
+        int remaining_iterations = dst->width % SIMD_WIDTH;
 
         uint32_t color_u32   = RaylibSIMD__ColorToU32(color);
         __m128i color_u32_4x = _mm_set1_epi32(color_u32);
 
-        unsigned char *dest = dst->data;
-        for (int iteration = 0; iteration < simd_iterations; iteration++)
+        int stride     = dst->width * bytes_per_pixel;
+        int row_offset = rec.x * bytes_per_pixel;
+        for (int y = 0; y < dst->height; y++)
         {
-            _mm_storeu_si128((__m128i *)dest, color_u32_4x);
-            dest += (bytes_per_pixel * SIMD_WIDTH);
-        }
+            unsigned char *dest_row = (unsigned char *)dst->data + (row_offset + (stride * y));
+            unsigned char *dest     = dest_row;
+            for (int iteration = 0; iteration < simd_iterations; iteration++)
+            {
+                _mm_storeu_si128((__m128i *)dest, color_u32_4x);
+                dest += (bytes_per_pixel * SIMD_WIDTH);
+            }
 
-        for (int iteration = 0; iteration < remaining_iterations; iteration++)
-            *dest++ = color_u32;
+            for (int iteration = 0; iteration < remaining_iterations; iteration++)
+                *dest++ = color_u32;
+        }
     }
     else
     {
-        // TODO(doyle): SIMD this path
-        RaylibSIMD_ImageDrawRectangle(dst, 0, 0, dst->width, dst->height, color);
+        Image imRec = RaylibSIMD_GenImageColor((int)rec.width, (int)rec.height, color);
+        RaylibSIMD_ImageDraw(dst, imRec, (Rectangle){0.f, 0.f, RS_CAST(float)rec.width, RS_CAST(float)rec.height}, rec, WHITE);
+        UnloadImage(imRec);
     }
 }
 
+void RaylibSIMD_ImageDrawRectangle(Image *dst, int posX, int posY, int width, int height, Color color)
+{
+    RaylibSIMD_ImageDrawRectangleRec(dst, (Rectangle){RS_CAST(float)posX, RS_CAST(float)posY, RS_CAST(float)width, RS_CAST(float)height}, color);
+}
+
+void RaylibSIMD_ImageClearBackground(Image *dst, Color color)
+{
+    RaylibSIMD_ImageDrawRectangleRec(dst, (Rectangle){0, 0, dst->width, dst->height}, color);
+}
 #endif // RAYLIB_SIMD_IMPLEMENTATION
