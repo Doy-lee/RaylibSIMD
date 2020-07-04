@@ -487,9 +487,68 @@ void RaylibSIMD_ImageDrawRectangle(Image *dst, int posX, int posY, int width, in
     RaylibSIMD_ImageDrawRectangleRec(dst, (Rectangle){RS_CAST(float)posX, RS_CAST(float)posY, RS_CAST(float)width, RS_CAST(float)height}, color);
 }
 
+RS_FILE_SCOPE int RaylibSIMD__FormatToBitsPerPixel(int format)
+{
+    int result = 4;
+    switch (format)
+    {
+        case UNCOMPRESSED_GRAYSCALE: result = 8; break;
+        case UNCOMPRESSED_GRAY_ALPHA:
+        case UNCOMPRESSED_R5G6B5:
+        case UNCOMPRESSED_R5G5B5A1:
+        case UNCOMPRESSED_R4G4B4A4: result = 16; break;
+        case UNCOMPRESSED_R8G8B8A8: result = 32; break;
+        case UNCOMPRESSED_R8G8B8: result = 24; break;
+        case UNCOMPRESSED_R32: result = 32; break;
+        case UNCOMPRESSED_R32G32B32: result = 32*3; break;
+        case UNCOMPRESSED_R32G32B32A32: result = 32*4; break;
+        case COMPRESSED_DXT1_RGB:
+        case COMPRESSED_DXT1_RGBA:
+        case COMPRESSED_ETC1_RGB:
+        case COMPRESSED_ETC2_RGB:
+        case COMPRESSED_PVRT_RGB:
+        case COMPRESSED_PVRT_RGBA: result = 4; break;
+        case COMPRESSED_DXT3_RGBA:
+        case COMPRESSED_DXT5_RGBA:
+        case COMPRESSED_ETC2_EAC_RGBA:
+        case COMPRESSED_ASTC_4x4_RGBA: result = 8; break;
+        case COMPRESSED_ASTC_8x8_RGBA: result = 2; break;
+        default: break;
+    }
+
+    return result;
+}
+
 void RaylibSIMD_ImageClearBackground(Image *dst, Color color)
 {
-    RaylibSIMD_ImageDrawRectangle(dst, 0, 0, dst->width, dst->height, color);
+    if (dst->format == UNCOMPRESSED_R8G8B8A8)
+    {
+        int bits_per_pixel  = RaylibSIMD__FormatToBitsPerPixel(dst->format);
+        int bytes_per_pixel = bits_per_pixel / 8;
+        int total_pixels    = dst->width * dst->height;
+
+        int const SIMD_WIDTH = 4;
+        int simd_iterations      = total_pixels / SIMD_WIDTH;
+        int remaining_iterations = total_pixels % SIMD_WIDTH;
+
+        uint32_t color_u32   = RaylibSIMD__ColorToU32(color);
+        __m128i color_u32_4x = _mm_set1_epi32(color_u32);
+
+        unsigned char *dest = dst->data;
+        for (int iteration = 0; iteration < simd_iterations; iteration++)
+        {
+            _mm_storeu_si128((__m128i *)dest, color_u32_4x);
+            dest += (bytes_per_pixel * SIMD_WIDTH);
+        }
+
+        for (int iteration = 0; iteration < remaining_iterations; iteration++)
+            *dest++ = color_u32;
+    }
+    else
+    {
+        // TODO(doyle): SIMD this path
+        RaylibSIMD_ImageDrawRectangle(dst, 0, 0, dst->width, dst->height, color);
+    }
 }
 
 #endif // RAYLIB_SIMD_IMPLEMENTATION
