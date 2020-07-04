@@ -246,6 +246,8 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
                     for (int x = 0; x < (int)srcRec.width; x++)
                     {
                         RaylibSIMD__SoftwareBlendPixel(src_ptr, dest_ptr, tint, src_alpha_min);
+                        src_ptr += bytesPerPixelSrc;
+                        dest_ptr += bytesPerPixelDst;
                     }
 
                     src_row += strideSrc;
