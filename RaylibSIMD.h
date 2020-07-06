@@ -203,7 +203,7 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
         RaylibSIMD_ImageDrawMode draw_mode = RaylibSIMD_ImageDrawMode_Original;
 
         if (dst->format == UNCOMPRESSED_R8G8B8A8 &&
-            (srcPtr->format == UNCOMPRESSED_R8G8B8A8 || srcPtr->format == UNCOMPRESSED_R8G8B8))
+            (srcPtr->format == UNCOMPRESSED_R8G8B8A8 || srcPtr->format == UNCOMPRESSED_R8G8B8 || srcPtr->format == UNCOMPRESSED_R5G6B5))
         {
             draw_mode = RaylibSIMD_ImageDrawMode_SIMD;
         }
@@ -270,6 +270,26 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
 
             case RaylibSIMD_ImageDrawMode_SIMD:
             {
+                // NOTE: The general approach to SIMD the drawing loop is to
+                // pull out each pixel into each available f32 SIMD lane to
+                // do color blends in a [0, 1] 32 bit float space.
+                // For example a __m128 consists of 4x32 bit lanes.
+                //
+                // SIMD Register
+                // {[Pixel1] [Pixel2] [Pixel3] [Pixel4]}
+                //
+                // Followed by pulling each color component from pixels 1, 2,
+                // 3 and 4 into a SIMD lane to perform the color blend.
+                //
+                // {[R1] [R2] [R3] [R4]} Register 1
+                // {[G1] [G2] [G3] [G4]}    ..
+                // {[B1] [B2] [B3] [B4]}    ..
+                // {[A1] [A2] [A3] [A4]}    ..
+                //
+                // We collate the same colors of each pixel into the lanes
+                // because the required blend equation is the same across the
+                // same color components.
+
                 __m128 const inv_255_4x       = _mm_set1_ps(INV_255);
                 __m128 const tint_r01_4x      = _mm_set1_ps(tint.r * INV_255);
                 __m128 const tint_g01_4x      = _mm_set1_ps(tint.g * INV_255);
@@ -281,6 +301,22 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
 
                 float src_alpha_min        = 0.f;
                 __m128i src_pixels_shuffle = _mm_set_epi8(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0); // No-op shuffle.
+
+                int r_bit_shift = 0;
+                int g_bit_shift = 8;
+                int b_bit_shift = 16;
+                int a_bit_shift = 24;
+
+                __m128i r_mask_4x = _mm_set1_epi32(0xFF);
+                __m128i g_mask_4x = _mm_set1_epi32(0xFF);
+                __m128i b_mask_4x = _mm_set1_epi32(0xFF);
+                __m128i a_mask_4x = _mm_set1_epi32(0xFF);
+
+                __m128 src_r_to_01_space_coefficient = _mm_set1_ps(INV_255);
+                __m128 src_g_to_01_space_coefficient = _mm_set1_ps(INV_255);
+                __m128 src_b_to_01_space_coefficient = _mm_set1_ps(INV_255);
+                __m128 src_a_to_01_space_coefficient = _mm_set1_ps(INV_255);
+
                 if (srcPtr->format == UNCOMPRESSED_R8G8B8)
                 {
                     // NOTE: We load 4 pixels x 4 colors at a time. But if the
@@ -292,33 +328,82 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
                     // For example, naively loading the next pixels in a 3BPP
                     // byte stream, produces in a 128 bit SIMD register
                     //
-                    // Pixel | 1    2    3    4
-                    // Color | RGBR GBRG BRGB RGBR
-                    //            ^
-                    //            |
-                    //            +---- This is the 2nd pixel's Red Component
+                    // Pixel    |   1  2     3     4     5  6*
+                    // Register | {[RGBR] [GBRG] [BRGB] [RGBR]}
+                    //              ^
+                    //              |
+                    //              +---- This is the start of the 2nd pixel.
                     //
-                    // The subsequent pixels needs to shift the color channels
-                    // to correctly set up the RGB components and so forth for
-                    // subsequent pixels.
+                    // * Note that only the red channel of the 6th pixel gets loaded.
                     //
-                    // Pixel | 1    2    3    4
-                    // Color | RGBR RGBR RGBR RGBR
+                    // The 2nd pixel needs to be moved into the SIMD lane.
+                    // and so forth for subsequent pixels. We shift the color
+                    // channels to correctly set up the SIMD lane, like so.
+                    //
+                    // Pixel    |   1      2      3      4
+                    // Register | {[RGB.] [RGB.] [RGB.] [RGB.]]}
                     //
                     // We do this by shuffling the loaded bits into place
                     // duplicating the red channel and copying onwards. In the
                     // RGBA case, we do a no-op shuffle that preserves positions
                     // of all color components to avoid branches in the blitting
                     // hot path.
-                    //
+
                     src_alpha_min      = 255.f;
-                    src_pixels_shuffle = _mm_set_epi8(12, 11, 10, 9, 9, 8, 7, 6, 6, 5, 4, 3, 3, 2, 1, 0);
+                    src_pixels_shuffle = _mm_setr_epi8(0, 1, 2, 3, 3, 4, 5, 6, 6, 7, 8, 9, 9, 10, 11, 12);
+                }
+                else if (srcPtr->format == UNCOMPRESSED_R5G6B5)
+                {
+                    // NOTE: For a 128bit SIMD register with 4 lanes of 32 bits,
+                    // we can store 2 pixels per register.
+                    //
+                    // RGB565 Pixel
+                    // Bits       | 01234 | 56789 10 | 11 12 13 14 15
+                    // Color Bits | RRRRR | GGGGG  G |  B  B  B  B  B
+                    //
+                    // Register   | {[P1, P2] [P3, P4] [P5, P6] [P7, P8]}
+                    //
+                    // See UNCOMPRESSED_R8G8B8 for reason for shuffle. Our
+                    // desired pattern is 1 pixel per lane for color blending in
+                    // [0, 1] normalized 32bit float space.
+                    //
+                    // Register   | {[P1]   [P2]    [P3]    [P4]}
+                    // Bits       |  [0:15] [16:31] [32:46] [46:61]
+                    // Bytes      |  [0:1]  [2:3]   [4:5]   [6:7]
+
+                    r_bit_shift = 11;
+                    g_bit_shift = 5;
+                    b_bit_shift = 0;
+
+                    r_mask_4x = _mm_set1_epi32(0b011111);
+                    g_mask_4x = _mm_set1_epi32(0b111111);
+                    b_mask_4x = _mm_set1_epi32(0b011111);
+
+                    src_alpha_min      = 255.f;
+                    src_pixels_shuffle = _mm_setr_epi8(0, 1, 0, 1, // Lane 1
+                                                       2, 3, 2, 3,
+                                                       4, 5, 4, 5,
+                                                       6, 7, 6, 7);
+
+                    src_r_to_01_space_coefficient = _mm_set1_ps(1.f/31.f);
+                    src_g_to_01_space_coefficient = _mm_set1_ps(1.f/63.f);
+                    src_b_to_01_space_coefficient = _mm_set1_ps(1.f/31.f);
                 }
 
-                int const SIMD_WIDTH           = 4;
-                __m128 const src_alpha_min_4x  = _mm_set1_ps(src_alpha_min);
-                int simd_x_iterations          = RS_CAST(int)srcRec.width / SIMD_WIDTH;
-                int remaining_x_iterations     = RS_CAST(int)srcRec.width % SIMD_WIDTH;
+                __m128 const src_alpha_min_4x = _mm_set1_ps(src_alpha_min);
+
+                // NOTE: Divide by float because we blend in [0,1] 32 bit float space
+                // Each color component requires 1 SIMD lane to perform such blend.
+                int const PIXELS_PER_SIMD_WRITE    = sizeof(__m128) / sizeof(float);
+                int const src_bits_per_pixel       = RaylibSIMD__FormatToBitsPerPixel(srcPtr->format);
+                int const src_bytes_per_pixel      = src_bits_per_pixel / 8;
+
+                int const src_bytes_per_simd_write  = PIXELS_PER_SIMD_WRITE * src_bytes_per_pixel;
+                int const dest_bytes_per_simd_write = PIXELS_PER_SIMD_WRITE * bytesPerPixelDst;
+
+                int const simd_iterations       = RS_CAST(int) srcRec.width / PIXELS_PER_SIMD_WRITE; // NOTE: Divison here rounds down fractional pixels
+                int const total_simd_pixels     = simd_iterations * PIXELS_PER_SIMD_WRITE;
+                int const remaining_iterations  = srcRec.width - total_simd_pixels;                  // NOTE: Ensure pixels fractionally written to are dealt with
 
                 unsigned char const *src_row = RS_CAST(unsigned char const *)pSrcBase;
                 unsigned char *dest_row      = RS_CAST(unsigned char *)pDstBase;
@@ -326,7 +411,7 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
                 {
                     unsigned char *src_ptr  = src_row;
                     unsigned char *dest_ptr = dest_row;
-                    for (int x = 0; x < simd_x_iterations; x++)
+                    for (int x = 0; x < simd_iterations; x++)
                     {
                         unsigned char *dest = dest_ptr;
 
@@ -336,8 +421,8 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
                         __m128i src_pixels_4x_shuffled = _mm_shuffle_epi8(src_pixels_4x, src_pixels_shuffle);
 
                         // NOTE: Advance Pixel Buffer
-                        src_ptr += (SIMD_WIDTH * bytesPerPixelSrc);
-                        dest_ptr += (SIMD_WIDTH * bytesPerPixelDst);
+                        src_ptr += src_bytes_per_simd_write;
+                        dest_ptr += dest_bytes_per_simd_write;
 
                         // NOTE: Unpack Source & Dest Pixel Layout for SIMD
                         // From {ABGR1, ABGR2, ABGR3, ABGR3} to {RRRR} {GGGG} {BBBB} {AAAA} where each
@@ -346,10 +431,10 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
                         //    1. Shift colour component to lowest 8 bits
                         //    2. Isolate the color component
                         //
-                        __m128i src0123_r_int = _mm_and_si128(_mm_srli_epi32(src_pixels_4x_shuffled, 0), hex_0xFF_4x);
-                        __m128i src0123_g_int = _mm_and_si128(_mm_srli_epi32(src_pixels_4x_shuffled, 8), hex_0xFF_4x);
-                        __m128i src0123_b_int = _mm_and_si128(_mm_srli_epi32(src_pixels_4x_shuffled, 16), hex_0xFF_4x);
-                        __m128i src0123_a_int = _mm_and_si128(_mm_srli_epi32(src_pixels_4x_shuffled, 24), hex_0xFF_4x);
+                        __m128i src0123_r_int = _mm_and_si128(_mm_srli_epi32(src_pixels_4x_shuffled, r_bit_shift), r_mask_4x);
+                        __m128i src0123_g_int = _mm_and_si128(_mm_srli_epi32(src_pixels_4x_shuffled, g_bit_shift), g_mask_4x);
+                        __m128i src0123_b_int = _mm_and_si128(_mm_srli_epi32(src_pixels_4x_shuffled, b_bit_shift), b_mask_4x);
+                        __m128i src0123_a_int = _mm_and_si128(_mm_srli_epi32(src_pixels_4x_shuffled, a_bit_shift), a_mask_4x);
 
                         __m128i dest0123_r_int = _mm_and_si128(_mm_srli_epi32(dest_pixels_4x, 0), hex_0xFF_4x);
                         __m128i dest0123_g_int = _mm_and_si128(_mm_srli_epi32(dest_pixels_4x, 8), hex_0xFF_4x);
@@ -372,10 +457,10 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
                         __m128 dest0123_a = _mm_cvtepi32_ps(dest0123_a_int);
 
                         // NOTE: Source Pixels to Normalized [0, 1] Float Space
-                        __m128 src0123_r01 = _mm_mul_ps(src0123_r, inv_255_4x);
-                        __m128 src0123_g01 = _mm_mul_ps(src0123_g, inv_255_4x);
-                        __m128 src0123_b01 = _mm_mul_ps(src0123_b, inv_255_4x);
-                        __m128 src0123_a01 = _mm_mul_ps(src0123_a, inv_255_4x);
+                        __m128 src0123_r01 = _mm_mul_ps(src0123_r, src_r_to_01_space_coefficient);
+                        __m128 src0123_g01 = _mm_mul_ps(src0123_g, src_g_to_01_space_coefficient);
+                        __m128 src0123_b01 = _mm_mul_ps(src0123_b, src_b_to_01_space_coefficient);
+                        __m128 src0123_a01 = _mm_mul_ps(src0123_a, src_a_to_01_space_coefficient);
 
                         // NOTE: Tint Source Pixels
                         __m128 src0123_tinted_r01 = _mm_mul_ps(src0123_r01, tint_r01_4x);
@@ -433,7 +518,7 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
                     }
 
                     // NOTE: Remaining iterations are done serially.
-                    for (int x = 0; x < remaining_x_iterations; x++)
+                    for (int x = 0; x < remaining_iterations; x++)
                     {
                         RaylibSIMD__SoftwareBlendPixel(src_ptr, dest_ptr, tint, src_alpha_min);
                         src_ptr += bytesPerPixelSrc;
