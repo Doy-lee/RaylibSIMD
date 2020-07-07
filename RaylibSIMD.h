@@ -354,27 +354,47 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
                     // of all color components to avoid branches in the blitting
                     // hot path.
 
+                    // NOTE: R8G8B8 24bit Pixel
+                    // Bits       | 23 22 21 20   19 18 17 16 | 15 14 13 12   11 10 9 8 | 7654 3210
+                    // Color Bits |  R  R  R  R    R  R  R  R | G   G  G  G    G  G G G | BBBB BBBB
+                    //
+                    // A 128bit SIMD register with 4x32bit lanes can store
+                    // 1 pixel per register and the red channel of the next
+                    // pixel.
+                    //
+                    // Pixel    |   1  2     3     4     5  6
+                    // Register | {[RGBR] [GBRG] [BRGB] [RGBR]}
+                    //
+                    // Desired layout 1 pixel per 32 bit lane
+                    //
+                    // Pixel           |   1      2      3      4
+                    // Register        | {[RGB.] [RGB.] [RGB.] [RGB.]]}
+                    // Bits            |  [0:23] [24:47] [48:71] [72:95]
+                    // Bytes (Shuffle) |  [0:2]  [3:5]   [6:8]   [9:11]
+
                     src_alpha_min      = 255.f;
-                    src_pixels_shuffle = _mm_setr_epi8(0, 1, 2, 3, 3, 4, 5, 6, 6, 7, 8, 9, 9, 10, 11, 12);
+                    src_pixels_shuffle = _mm_setr_epi8(0, 1, 2, 0, // Lane 1
+                                                       3, 4, 5, 0,
+                                                       6, 7, 8, 0,
+                                                       9, 10, 11, 0);
                 }
                 else if (srcPtr->format == UNCOMPRESSED_R5G6B5)
                 {
-                    // NOTE: For a 128bit SIMD register with 4 lanes of 32 bits,
-                    // we can store 2 pixels per register.
+                    // NOTE: RGB565 16bit Pixel
+                    // Bits       | 15 14 13 12 11 | 10 98765 | 43210
+                    // Color Bits |  R  R  R  R  R | G  GGGGG | BBBBB
                     //
-                    // RGB565 Pixel
-                    // Bits       | 01234 | 56789 10 | 11 12 13 14 15
-                    // Color Bits | RRRRR | GGGGG  G |  B  B  B  B  B
+                    // A 128bit SIMD register with 4x32bit lanes can store
+                    // 2 pixels per register.
                     //
                     // Register   | {[P1, P2] [P3, P4] [P5, P6] [P7, P8]}
                     //
-                    // See UNCOMPRESSED_R8G8B8 for reason for shuffle. Our
-                    // desired pattern is 1 pixel per lane for color blending in
-                    // [0, 1] normalized 32bit float space.
+                    // See UNCOMPRESSED_R8G8B8 for reason for shuffle.
+                    // Desired layout 1 pixel per 32 bit lane
                     //
-                    // Register   | {[P1]   [P2]    [P3]    [P4]}
-                    // Bits       |  [0:15] [16:31] [32:46] [46:61]
-                    // Bytes      |  [0:1]  [2:3]   [4:5]   [6:7]
+                    // Register        | {[P1]   [P2]    [P3]    [P4]}
+                    // Bits            |  [0:15] [16:31] [32:46] [46:61]
+                    // Bytes (Shuffle) |  [0:1]  [2:3]   [4:5]   [6:7]
 
                     r_bit_shift = 11;
                     g_bit_shift = 5;
@@ -396,22 +416,21 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
                 }
                 else if (srcPtr->format == UNCOMPRESSED_R5G5B5A1)
                 {
-                    // NOTE: For a 128bit SIMD register with 4 lanes of 32 bits,
-                    // we can store 2 pixels per register.
+                    // NOTE: RGBA5551 16bit Pixel
+                    // Bits       | 15 14 13 12 11 | 10 9876 | 54321 | 0
+                    // Color Bits |  R  R  R  R  R | G  GGGG | BBBBB | A
                     //
-                    // RGBA5551 Pixel
-                    // Bits       | 01234 | 56789 | 10 11 12 13 14 | 15
-                    // Color Bits | RRRRR | GGGGG |  B  B  B  B  B | A
+                    // A 128bit SIMD register with 4x32bit lanes can store
+                    // 2 pixels per register.
                     //
                     // Register   | {[P1, P2] [P3, P4] [P5, P6] [P7, P8]}
                     //
-                    // See UNCOMPRESSED_R8G8B8 for reason for shuffle. Our
-                    // desired pattern is 1 pixel per lane for color blending in
-                    // [0, 1] normalized 32bit float space.
+                    // See UNCOMPRESSED_R8G8B8 for reason for shuffle.
+                    // Desired layout 1 pixel per 32 bit lane
                     //
-                    // Register   | {[P1]   [P2]    [P3]    [P4]}
-                    // Bits       |  [0:15] [16:31] [32:46] [46:61]
-                    // Bytes      |  [0:1]  [2:3]   [4:5]   [6:7]
+                    // Register        | {[P1]   [P2]    [P3]    [P4]}
+                    // Bits            |  [0:15] [16:31] [32:46] [46:61]
+                    // Bytes (Shuffle) |  [0:1]  [2:3]   [4:5]   [6:7]
 
                     r_bit_shift = 11;
                     g_bit_shift = 6;
@@ -435,22 +454,21 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
                 }
                 else if (srcPtr->format == UNCOMPRESSED_R4G4B4A4)
                 {
-                    // NOTE: For a 128bit SIMD register with 4 lanes of 32 bits,
-                    // we can store 2 16bit pixels per register.
+                    // NOTE: RGBA4444 16bit Pixel
+                    // Bits       | 15 14 13 12 | 11 10 98 | 7654 | 3210
+                    // Color Bits |  R  R  R  R | G   G GG | BBBB | AAAA
                     //
-                    // RGBA5551 Pixel
-                    // Bits       | 0123 | 4567 | 89 10 11 | 12 13 14 15
-                    // Color Bits | RRRR | GGGG | BB  B  B |  A  A  A  A
+                    // A 128bit SIMD register with 4x32bit lanes can store
+                    // 2 pixels per register.
                     //
                     // Register   | {[P1, P2] [P3, P4] [P5, P6] [P7, P8]}
                     //
-                    // See UNCOMPRESSED_R8G8B8 for reason for shuffle. Our
-                    // desired pattern is 1 pixel per lane for color blending in
-                    // [0, 1] normalized 32bit float space.
+                    // See UNCOMPRESSED_R8G8B8 for reason for shuffle.
+                    // Desired layout 1 pixel per 32 bit lane
                     //
-                    // Register   | {[P1]   [P2]    [P3]    [P4]}
-                    // Bits       |  [0:15] [16:31] [32:46] [46:61]
-                    // Bytes      |  [0:1]  [2:3]   [4:5]   [6:7]
+                    // Register        | {[P1]   [P2]    [P3]    [P4]}
+                    // Bits            |  [0:15] [16:31] [32:46] [46:61]
+                    // Bytes (Shuffle) |  [0:1]  [2:3]   [4:5]   [6:7]
 
                     r_bit_shift = 12;
                     g_bit_shift = 8;
