@@ -203,7 +203,12 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
         RaylibSIMD_ImageDrawMode draw_mode = RaylibSIMD_ImageDrawMode_Original;
 
         if (dst->format == UNCOMPRESSED_R8G8B8A8 &&
-            (srcPtr->format == UNCOMPRESSED_R8G8B8A8 || srcPtr->format == UNCOMPRESSED_R8G8B8 || srcPtr->format == UNCOMPRESSED_R5G6B5))
+            (srcPtr->format == UNCOMPRESSED_R8G8B8A8 ||
+             srcPtr->format == UNCOMPRESSED_R8G8B8 ||
+             srcPtr->format == UNCOMPRESSED_R5G6B5 ||
+             srcPtr->format == UNCOMPRESSED_R5G5B5A1 ||
+             srcPtr->format == UNCOMPRESSED_R4G4B4A4
+             ))
         {
             draw_mode = RaylibSIMD_ImageDrawMode_SIMD;
         }
@@ -389,6 +394,84 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
                     src_g_to_01_space_coefficient = _mm_set1_ps(1.f/63.f);
                     src_b_to_01_space_coefficient = _mm_set1_ps(1.f/31.f);
                 }
+                else if (srcPtr->format == UNCOMPRESSED_R5G5B5A1)
+                {
+                    // NOTE: For a 128bit SIMD register with 4 lanes of 32 bits,
+                    // we can store 2 pixels per register.
+                    //
+                    // RGBA5551 Pixel
+                    // Bits       | 01234 | 56789 | 10 11 12 13 14 | 15
+                    // Color Bits | RRRRR | GGGGG |  B  B  B  B  B | A
+                    //
+                    // Register   | {[P1, P2] [P3, P4] [P5, P6] [P7, P8]}
+                    //
+                    // See UNCOMPRESSED_R8G8B8 for reason for shuffle. Our
+                    // desired pattern is 1 pixel per lane for color blending in
+                    // [0, 1] normalized 32bit float space.
+                    //
+                    // Register   | {[P1]   [P2]    [P3]    [P4]}
+                    // Bits       |  [0:15] [16:31] [32:46] [46:61]
+                    // Bytes      |  [0:1]  [2:3]   [4:5]   [6:7]
+
+                    r_bit_shift = 11;
+                    g_bit_shift = 6;
+                    b_bit_shift = 1;
+                    a_bit_shift = 0;
+
+                    r_mask_4x = _mm_set1_epi32(0b11111);
+                    g_mask_4x = _mm_set1_epi32(0b11111);
+                    b_mask_4x = _mm_set1_epi32(0b11111);
+                    a_mask_4x = _mm_set1_epi32(0b00001);
+
+                    src_pixels_shuffle = _mm_setr_epi8(0, 1, 0, 1, // Lane 1
+                                                       2, 3, 2, 3,
+                                                       4, 5, 4, 5,
+                                                       6, 7, 6, 7);
+
+                    src_r_to_01_space_coefficient = _mm_set1_ps(1.f/31.f);
+                    src_g_to_01_space_coefficient = _mm_set1_ps(1.f/31.f);
+                    src_b_to_01_space_coefficient = _mm_set1_ps(1.f/31.f);
+                    src_a_to_01_space_coefficient = _mm_set1_ps(1.f);
+                }
+                else if (srcPtr->format == UNCOMPRESSED_R4G4B4A4)
+                {
+                    // NOTE: For a 128bit SIMD register with 4 lanes of 32 bits,
+                    // we can store 2 16bit pixels per register.
+                    //
+                    // RGBA5551 Pixel
+                    // Bits       | 0123 | 4567 | 89 10 11 | 12 13 14 15
+                    // Color Bits | RRRR | GGGG | BB  B  B |  A  A  A  A
+                    //
+                    // Register   | {[P1, P2] [P3, P4] [P5, P6] [P7, P8]}
+                    //
+                    // See UNCOMPRESSED_R8G8B8 for reason for shuffle. Our
+                    // desired pattern is 1 pixel per lane for color blending in
+                    // [0, 1] normalized 32bit float space.
+                    //
+                    // Register   | {[P1]   [P2]    [P3]    [P4]}
+                    // Bits       |  [0:15] [16:31] [32:46] [46:61]
+                    // Bytes      |  [0:1]  [2:3]   [4:5]   [6:7]
+
+                    r_bit_shift = 12;
+                    g_bit_shift = 8;
+                    b_bit_shift = 4;
+                    a_bit_shift = 0;
+
+                    r_mask_4x = _mm_set1_epi32(0b1111);
+                    g_mask_4x = _mm_set1_epi32(0b1111);
+                    b_mask_4x = _mm_set1_epi32(0b1111);
+                    a_mask_4x = _mm_set1_epi32(0b1111);
+
+                    src_pixels_shuffle = _mm_setr_epi8(0, 1, 0, 1, // Lane 1
+                                                       2, 3, 2, 3,
+                                                       4, 5, 4, 5,
+                                                       6, 7, 6, 7);
+
+                    src_r_to_01_space_coefficient = _mm_set1_ps(1.f/15.f);
+                    src_g_to_01_space_coefficient = _mm_set1_ps(1.f/15.f);
+                    src_b_to_01_space_coefficient = _mm_set1_ps(1.f/15.f);
+                    src_a_to_01_space_coefficient = _mm_set1_ps(1.f/15.f);
+                }
 
                 __m128 const src_alpha_min_4x = _mm_set1_ps(src_alpha_min);
 
@@ -447,8 +530,8 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
                         __m128 src0123_b  = _mm_cvtepi32_ps(src0123_b_int);
                         __m128 src0123_a  = _mm_cvtepi32_ps(src0123_a_int);
 
-                        // NOTE: For 3BPP Images the src_alpha_min_4x is set to 255 to completely overwrite dest.
-                        //       For 4BPP Images the src_alpha_min_4x is set to 0 (i.e. no-op)
+                        // NOTE: For images without an alpha component the src_alpha_min_4x is set to 255 to completely overwrite dest.
+                        //       For images with an alpha component the src_alpha_min_4x is set to 0 (i.e. no-op)
                         src0123_a = _mm_max_ps(src0123_a, src_alpha_min_4x);
 
                         __m128 dest0123_r = _mm_cvtepi32_ps(dest0123_r_int);
