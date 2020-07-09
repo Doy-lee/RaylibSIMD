@@ -109,6 +109,215 @@ RS_FILE_SCOPE void RaylibSIMD__SoftwareBlendPixel(unsigned char const *src_ptr, 
     *(RS_CAST(uint32_t *)dest_ptr) = blend_pixel;
 }
 
+typedef struct
+{
+    __m128i shuffle;
+    uint8_t r_bit_mask;
+    uint8_t g_bit_mask;
+    uint8_t b_bit_mask;
+    uint8_t a_bit_mask;
+    uint8_t r_bit_shift;
+    uint8_t g_bit_shift;
+    uint8_t b_bit_shift;
+    uint8_t a_bit_shift;
+    float r_to_01_coefficient;
+    float b_to_01_coefficient;
+    float g_to_01_coefficient;
+    float a_to_01_coefficient;
+} RaylibSIMD_PixelPerLaneShuffle;
+
+static RaylibSIMD_PixelPerLaneShuffle RaylibSIMD__FormatToPixelPerLaneShuffle128Bit(int format)
+{
+    RaylibSIMD_PixelPerLaneShuffle result = {0};
+    result.shuffle                        = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    result.r_bit_mask                     = 0xFF;
+    result.g_bit_mask                     = 0xFF;
+    result.b_bit_mask                     = 0xFF;
+    result.a_bit_mask                     = 0xFF;
+    result.r_bit_shift                    = 0;
+    result.g_bit_shift                    = 8;
+    result.b_bit_shift                    = 16;
+    result.a_bit_shift                    = 24;
+    result.r_to_01_coefficient            = 1.f / 255.f;
+    result.g_to_01_coefficient            = 1.f / 255.f;
+    result.b_to_01_coefficient            = 1.f / 255.f;
+    result.a_to_01_coefficient            = 1.f / 255.f;
+
+    switch(format)
+    {
+        default: break;
+
+        // NOTE: We load 4 pixels x 4 colors at a time. But if the
+        // source image is RGB, then the 4th color loaded in each
+        // pixel is going to be the RED component of the next pixel.
+        //
+        // Pixels[] = {RGB, RGB, RGB, RGB, ...}
+        //
+        // For example, naively loading the next pixels in a 3BPP
+        // byte stream, produces in a 128 bit SIMD register
+        //
+        // Pixel    |   1  2     3     4     5  6*
+        // Register | {[RGBR] [GBRG] [BRGB] [RGBR]}
+        //              ^
+        //              |
+        //              +---- This is the start of the 2nd pixel.
+        //
+        // * Note that only the red channel of the 6th pixel gets loaded.
+        //
+        // The 2nd pixel needs to be moved into the SIMD lane.
+        // and so forth for subsequent pixels. We shift the color
+        // channels to correctly set up the SIMD lane, like so.
+        //
+        // Pixel    |   1      2      3      4
+        // Register | {[RGB.] [RGB.] [RGB.] [RGB.]]}
+        //
+        // We do this by shuffling the loaded bits into place
+        // duplicating the red channel and copying onwards. In the
+        // RGBA case, we do a no-op shuffle that preserves positions
+        // of all color components to avoid branches in the blitting
+        // hot path.
+
+        // NOTE: R8G8B8 24bit Pixel
+        // Bits       | 23 22 21 20   19 18 17 16 | 15 14 13 12   11 10 9 8 | 7654 3210
+        // Color Bits |  R  R  R  R    R  R  R  R | G   G  G  G    G  G G G | BBBB BBBB
+        //
+        // A 128bit SIMD register with 4x32bit lanes can store
+        // 1 pixel per register and the red channel of the next
+        // pixel.
+        //
+        // Pixel    |   1  2     3     4     5  6
+        // Register | {[RGBR] [GBRG] [BRGB] [RGBR]}
+        //
+        // Desired layout 1 pixel per 32 bit lane
+        //
+        // Pixel           |   1      2      3      4
+        // Register        | {[RGB.] [RGB.] [RGB.] [RGB.]]}
+        // Bits            |  [0:23] [24:47] [48:71] [72:95]
+        // Bytes (Shuffle) |  [0:2]  [3:5]   [6:8]   [9:11]
+        case UNCOMPRESSED_R8G8B8:
+        {
+            result.shuffle = _mm_setr_epi8(0, 1, 2, 0, // Lane 1
+                                           3, 4, 5, 0,
+                                           6, 7, 8, 0,
+                                           9, 10, 11, 0);
+        }
+        break;
+
+        // NOTE: RGBA4444 16bit Pixel
+        // Bits       | 15 14 13 12 | 11 10 98 | 7654 | 3210
+        // Color Bits |  R  R  R  R | G   G GG | BBBB | AAAA
+        //
+        // A 128bit SIMD register with 4x32bit lanes can store
+        // 2 pixels per register.
+        //
+        // Register   | {[P1, P2] [P3, P4] [P5, P6] [P7, P8]}
+        //
+        // See UNCOMPRESSED_R8G8B8 for reason for shuffle.
+        // Desired layout 1 pixel per 32 bit lane
+        //
+        // Register        | {[P1]   [P2]    [P3]    [P4]}
+        // Bits            |  [0:15] [16:31] [32:46] [46:61]
+        // Bytes (Shuffle) |  [0:1]  [2:3]   [4:5]   [6:7]
+        case UNCOMPRESSED_R4G4B4A4:
+        {
+            result.shuffle = _mm_setr_epi8(0, 1, 0, 1, // Lane 1
+                                           2, 3, 2, 3,
+                                           4, 5, 4, 5,
+                                           6, 7, 6, 7);
+            result.r_bit_mask = 0b1111;
+            result.g_bit_mask = 0b1111;
+            result.b_bit_mask = 0b1111;
+            result.a_bit_mask = 0b1111;
+
+            result.r_bit_shift = 12;
+            result.g_bit_shift = 8;
+            result.b_bit_shift = 4;
+            result.a_bit_shift = 0;
+
+            result.r_to_01_coefficient = 1.f/15.f;
+            result.g_to_01_coefficient = 1.f/15.f;
+            result.b_to_01_coefficient = 1.f/15.f;
+            result.a_to_01_coefficient = 1.f/15.f;
+        }
+        break;
+
+        // NOTE: RGB565 16bit Pixel
+        // Bits       | 15 14 13 12 11 | 10 98765 | 43210
+        // Color Bits |  R  R  R  R  R | G  GGGGG | BBBBB
+        //
+        // A 128bit SIMD register with 4x32bit lanes can store
+        // 2 pixels per register.
+        //
+        // Register   | {[P1, P2] [P3, P4] [P5, P6] [P7, P8]}
+        //
+        // See UNCOMPRESSED_R8G8B8 for reason for shuffle.
+        // Desired layout 1 pixel per 32 bit lane
+        //
+        // Register        | {[P1]   [P2]    [P3]    [P4]}
+        // Bits            |  [0:15] [16:31] [32:46] [46:61]
+        // Bytes (Shuffle) |  [0:1]  [2:3]   [4:5]   [6:7]
+        case UNCOMPRESSED_R5G6B5:
+        {
+            result.shuffle = _mm_setr_epi8(0, 1, 0, 1, // Lane 1
+                                           2, 3, 2, 3,
+                                           4, 5, 4, 5,
+                                           6, 7, 6, 7);
+            result.r_bit_mask = 0b011111;
+            result.g_bit_mask = 0b111111;
+            result.b_bit_mask = 0b011111;
+
+            result.r_bit_shift = 11;
+            result.g_bit_shift = 5;
+            result.b_bit_shift = 0;
+
+            result.r_to_01_coefficient = 1.f/31.f;
+            result.g_to_01_coefficient = 1.f/63.f;
+            result.b_to_01_coefficient = 1.f/31.f;
+        }
+        break;
+
+        // NOTE: RGBA5551 16bit Pixel
+        // Bits       | 15 14 13 12 11 | 10 9876 | 54321 | 0
+        // Color Bits |  R  R  R  R  R | G  GGGG | BBBBB | A
+        //
+        // A 128bit SIMD register with 4x32bit lanes can store
+        // 2 pixels per register.
+        //
+        // Register   | {[P1, P2] [P3, P4] [P5, P6] [P7, P8]}
+        //
+        // See UNCOMPRESSED_R8G8B8 for reason for shuffle.
+        // Desired layout 1 pixel per 32 bit lane
+        //
+        // Register        | {[P1]   [P2]    [P3]    [P4]}
+        // Bits            |  [0:15] [16:31] [32:46] [46:61]
+        // Bytes (Shuffle) |  [0:1]  [2:3]   [4:5]   [6:7]
+        case UNCOMPRESSED_R5G5B5A1:
+        {
+            result.shuffle = _mm_setr_epi8(0, 1, 0, 1, // Lane 1
+                                           2, 3, 2, 3,
+                                           4, 5, 4, 5,
+                                           6, 7, 6, 7);
+            result.r_bit_mask = 0b11111;
+            result.g_bit_mask = 0b11111;
+            result.b_bit_mask = 0b11111;
+            result.a_bit_mask = 0b00001;
+
+            result.r_bit_shift = 11;
+            result.g_bit_shift = 6;
+            result.b_bit_shift = 1;
+            result.a_bit_shift = 0;
+
+            result.r_to_01_coefficient = 1.f/31.f;
+            result.g_to_01_coefficient = 1.f/31.f;
+            result.b_to_01_coefficient = 1.f/31.f;
+            result.a_to_01_coefficient = 1.f;
+        }
+        break;
+    }
+
+    return result;
+}
+
 typedef enum
 {
     RaylibSIMD_ImageDrawMode_Original,
@@ -295,7 +504,6 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
                 // because the required blend equation is the same across the
                 // same color components.
 
-                __m128 const inv_255_4x       = _mm_set1_ps(INV_255);
                 __m128 const tint_r01_4x      = _mm_set1_ps(tint.r * INV_255);
                 __m128 const tint_g01_4x      = _mm_set1_ps(tint.g * INV_255);
                 __m128 const tint_b01_4x      = _mm_set1_ps(tint.b * INV_255);
@@ -304,200 +512,40 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
                 __m128 const u255_4x          = _mm_set1_ps(255.f);
                 __m128i const hex_0xFF_4x     = _mm_set1_epi32(0xFF);
 
-                float src_alpha_min        = 0.f;
-                __m128i src_pixels_shuffle = _mm_set_epi8(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0); // No-op shuffle.
+                float src_alpha_min = 0.f;
+                if (srcPtr->format == UNCOMPRESSED_R8G8B8)      src_alpha_min = 255.f;
+                else if (srcPtr->format == UNCOMPRESSED_R5G6B5) src_alpha_min = 255.f;
 
-                int r_bit_shift = 0;
-                int g_bit_shift = 8;
-                int b_bit_shift = 16;
-                int a_bit_shift = 24;
+                RaylibSIMD_PixelPerLaneShuffle src_lanes  = RaylibSIMD__FormatToPixelPerLaneShuffle128Bit(srcPtr->format);
+                RaylibSIMD_PixelPerLaneShuffle dest_lanes = RaylibSIMD__FormatToPixelPerLaneShuffle128Bit(dst->format);
 
-                __m128i r_mask_4x = _mm_set1_epi32(0xFF);
-                __m128i g_mask_4x = _mm_set1_epi32(0xFF);
-                __m128i b_mask_4x = _mm_set1_epi32(0xFF);
-                __m128i a_mask_4x = _mm_set1_epi32(0xFF);
+                __m128 const src_alpha_min_4x   = _mm_set1_ps(src_alpha_min);
 
-                __m128 src_r_to_01_space_coefficient = _mm_set1_ps(INV_255);
-                __m128 src_g_to_01_space_coefficient = _mm_set1_ps(INV_255);
-                __m128 src_b_to_01_space_coefficient = _mm_set1_ps(INV_255);
-                __m128 src_a_to_01_space_coefficient = _mm_set1_ps(INV_255);
+                __m128i src_r_bit_mask          = _mm_set1_epi32(src_lanes.r_bit_mask);
+                __m128i src_g_bit_mask          = _mm_set1_epi32(src_lanes.g_bit_mask);
+                __m128i src_b_bit_mask          = _mm_set1_epi32(src_lanes.b_bit_mask);
+                __m128i src_a_bit_mask          = _mm_set1_epi32(src_lanes.a_bit_mask);
 
-                if (srcPtr->format == UNCOMPRESSED_R8G8B8)
-                {
-                    // NOTE: We load 4 pixels x 4 colors at a time. But if the
-                    // source image is RGB, then the 4th color loaded in each
-                    // pixel is going to be the RED component of the next pixel.
-                    //
-                    // Pixels[] = {RGB, RGB, RGB, RGB, ...}
-                    //
-                    // For example, naively loading the next pixels in a 3BPP
-                    // byte stream, produces in a 128 bit SIMD register
-                    //
-                    // Pixel    |   1  2     3     4     5  6*
-                    // Register | {[RGBR] [GBRG] [BRGB] [RGBR]}
-                    //              ^
-                    //              |
-                    //              +---- This is the start of the 2nd pixel.
-                    //
-                    // * Note that only the red channel of the 6th pixel gets loaded.
-                    //
-                    // The 2nd pixel needs to be moved into the SIMD lane.
-                    // and so forth for subsequent pixels. We shift the color
-                    // channels to correctly set up the SIMD lane, like so.
-                    //
-                    // Pixel    |   1      2      3      4
-                    // Register | {[RGB.] [RGB.] [RGB.] [RGB.]]}
-                    //
-                    // We do this by shuffling the loaded bits into place
-                    // duplicating the red channel and copying onwards. In the
-                    // RGBA case, we do a no-op shuffle that preserves positions
-                    // of all color components to avoid branches in the blitting
-                    // hot path.
+                __m128 src_r_to_01_coefficient  = _mm_set1_ps(src_lanes.r_to_01_coefficient);
+                __m128 src_g_to_01_coefficient  = _mm_set1_ps(src_lanes.g_to_01_coefficient);
+                __m128 src_b_to_01_coefficient  = _mm_set1_ps(src_lanes.b_to_01_coefficient);
+                __m128 src_a_to_01_coefficient  = _mm_set1_ps(src_lanes.a_to_01_coefficient);
 
-                    // NOTE: R8G8B8 24bit Pixel
-                    // Bits       | 23 22 21 20   19 18 17 16 | 15 14 13 12   11 10 9 8 | 7654 3210
-                    // Color Bits |  R  R  R  R    R  R  R  R | G   G  G  G    G  G G G | BBBB BBBB
-                    //
-                    // A 128bit SIMD register with 4x32bit lanes can store
-                    // 1 pixel per register and the red channel of the next
-                    // pixel.
-                    //
-                    // Pixel    |   1  2     3     4     5  6
-                    // Register | {[RGBR] [GBRG] [BRGB] [RGBR]}
-                    //
-                    // Desired layout 1 pixel per 32 bit lane
-                    //
-                    // Pixel           |   1      2      3      4
-                    // Register        | {[RGB.] [RGB.] [RGB.] [RGB.]]}
-                    // Bits            |  [0:23] [24:47] [48:71] [72:95]
-                    // Bytes (Shuffle) |  [0:2]  [3:5]   [6:8]   [9:11]
+                __m128i dest_r_bit_mask         = _mm_set1_epi32(dest_lanes.r_bit_mask);
+                __m128i dest_g_bit_mask         = _mm_set1_epi32(dest_lanes.g_bit_mask);
+                __m128i dest_b_bit_mask         = _mm_set1_epi32(dest_lanes.b_bit_mask);
+                __m128i dest_a_bit_mask         = _mm_set1_epi32(dest_lanes.a_bit_mask);
 
-                    src_alpha_min      = 255.f;
-                    src_pixels_shuffle = _mm_setr_epi8(0, 1, 2, 0, // Lane 1
-                                                       3, 4, 5, 0,
-                                                       6, 7, 8, 0,
-                                                       9, 10, 11, 0);
-                }
-                else if (srcPtr->format == UNCOMPRESSED_R5G6B5)
-                {
-                    // NOTE: RGB565 16bit Pixel
-                    // Bits       | 15 14 13 12 11 | 10 98765 | 43210
-                    // Color Bits |  R  R  R  R  R | G  GGGGG | BBBBB
-                    //
-                    // A 128bit SIMD register with 4x32bit lanes can store
-                    // 2 pixels per register.
-                    //
-                    // Register   | {[P1, P2] [P3, P4] [P5, P6] [P7, P8]}
-                    //
-                    // See UNCOMPRESSED_R8G8B8 for reason for shuffle.
-                    // Desired layout 1 pixel per 32 bit lane
-                    //
-                    // Register        | {[P1]   [P2]    [P3]    [P4]}
-                    // Bits            |  [0:15] [16:31] [32:46] [46:61]
-                    // Bytes (Shuffle) |  [0:1]  [2:3]   [4:5]   [6:7]
-
-                    r_bit_shift = 11;
-                    g_bit_shift = 5;
-                    b_bit_shift = 0;
-
-                    r_mask_4x = _mm_set1_epi32(0b011111);
-                    g_mask_4x = _mm_set1_epi32(0b111111);
-                    b_mask_4x = _mm_set1_epi32(0b011111);
-
-                    src_alpha_min      = 255.f;
-                    src_pixels_shuffle = _mm_setr_epi8(0, 1, 0, 1, // Lane 1
-                                                       2, 3, 2, 3,
-                                                       4, 5, 4, 5,
-                                                       6, 7, 6, 7);
-
-                    src_r_to_01_space_coefficient = _mm_set1_ps(1.f/31.f);
-                    src_g_to_01_space_coefficient = _mm_set1_ps(1.f/63.f);
-                    src_b_to_01_space_coefficient = _mm_set1_ps(1.f/31.f);
-                }
-                else if (srcPtr->format == UNCOMPRESSED_R5G5B5A1)
-                {
-                    // NOTE: RGBA5551 16bit Pixel
-                    // Bits       | 15 14 13 12 11 | 10 9876 | 54321 | 0
-                    // Color Bits |  R  R  R  R  R | G  GGGG | BBBBB | A
-                    //
-                    // A 128bit SIMD register with 4x32bit lanes can store
-                    // 2 pixels per register.
-                    //
-                    // Register   | {[P1, P2] [P3, P4] [P5, P6] [P7, P8]}
-                    //
-                    // See UNCOMPRESSED_R8G8B8 for reason for shuffle.
-                    // Desired layout 1 pixel per 32 bit lane
-                    //
-                    // Register        | {[P1]   [P2]    [P3]    [P4]}
-                    // Bits            |  [0:15] [16:31] [32:46] [46:61]
-                    // Bytes (Shuffle) |  [0:1]  [2:3]   [4:5]   [6:7]
-
-                    r_bit_shift = 11;
-                    g_bit_shift = 6;
-                    b_bit_shift = 1;
-                    a_bit_shift = 0;
-
-                    r_mask_4x = _mm_set1_epi32(0b11111);
-                    g_mask_4x = _mm_set1_epi32(0b11111);
-                    b_mask_4x = _mm_set1_epi32(0b11111);
-                    a_mask_4x = _mm_set1_epi32(0b00001);
-
-                    src_pixels_shuffle = _mm_setr_epi8(0, 1, 0, 1, // Lane 1
-                                                       2, 3, 2, 3,
-                                                       4, 5, 4, 5,
-                                                       6, 7, 6, 7);
-
-                    src_r_to_01_space_coefficient = _mm_set1_ps(1.f/31.f);
-                    src_g_to_01_space_coefficient = _mm_set1_ps(1.f/31.f);
-                    src_b_to_01_space_coefficient = _mm_set1_ps(1.f/31.f);
-                    src_a_to_01_space_coefficient = _mm_set1_ps(1.f);
-                }
-                else if (srcPtr->format == UNCOMPRESSED_R4G4B4A4)
-                {
-                    // NOTE: RGBA4444 16bit Pixel
-                    // Bits       | 15 14 13 12 | 11 10 98 | 7654 | 3210
-                    // Color Bits |  R  R  R  R | G   G GG | BBBB | AAAA
-                    //
-                    // A 128bit SIMD register with 4x32bit lanes can store
-                    // 2 pixels per register.
-                    //
-                    // Register   | {[P1, P2] [P3, P4] [P5, P6] [P7, P8]}
-                    //
-                    // See UNCOMPRESSED_R8G8B8 for reason for shuffle.
-                    // Desired layout 1 pixel per 32 bit lane
-                    //
-                    // Register        | {[P1]   [P2]    [P3]    [P4]}
-                    // Bits            |  [0:15] [16:31] [32:46] [46:61]
-                    // Bytes (Shuffle) |  [0:1]  [2:3]   [4:5]   [6:7]
-
-                    r_bit_shift = 12;
-                    g_bit_shift = 8;
-                    b_bit_shift = 4;
-                    a_bit_shift = 0;
-
-                    r_mask_4x = _mm_set1_epi32(0b1111);
-                    g_mask_4x = _mm_set1_epi32(0b1111);
-                    b_mask_4x = _mm_set1_epi32(0b1111);
-                    a_mask_4x = _mm_set1_epi32(0b1111);
-
-                    src_pixels_shuffle = _mm_setr_epi8(0, 1, 0, 1, // Lane 1
-                                                       2, 3, 2, 3,
-                                                       4, 5, 4, 5,
-                                                       6, 7, 6, 7);
-
-                    src_r_to_01_space_coefficient = _mm_set1_ps(1.f/15.f);
-                    src_g_to_01_space_coefficient = _mm_set1_ps(1.f/15.f);
-                    src_b_to_01_space_coefficient = _mm_set1_ps(1.f/15.f);
-                    src_a_to_01_space_coefficient = _mm_set1_ps(1.f/15.f);
-                }
-
-                __m128 const src_alpha_min_4x = _mm_set1_ps(src_alpha_min);
+                __m128 dest_r_to_01_coefficient = _mm_set1_ps(dest_lanes.r_to_01_coefficient);
+                __m128 dest_g_to_01_coefficient = _mm_set1_ps(dest_lanes.g_to_01_coefficient);
+                __m128 dest_b_to_01_coefficient = _mm_set1_ps(dest_lanes.b_to_01_coefficient);
+                __m128 dest_a_to_01_coefficient = _mm_set1_ps(dest_lanes.a_to_01_coefficient);
 
                 // NOTE: Divide by float because we blend in [0,1] 32 bit float space
                 // Each color component requires 1 SIMD lane to perform such blend.
-                int const PIXELS_PER_SIMD_WRITE    = sizeof(__m128) / sizeof(float);
-                int const src_bits_per_pixel       = RaylibSIMD__FormatToBitsPerPixel(srcPtr->format);
-                int const src_bytes_per_pixel      = src_bits_per_pixel / 8;
+                int const PIXELS_PER_SIMD_WRITE = sizeof(__m128) / sizeof(float);
+                int const src_bits_per_pixel    = RaylibSIMD__FormatToBitsPerPixel(srcPtr->format);
+                int const src_bytes_per_pixel   = src_bits_per_pixel / 8;
 
                 int const src_bytes_per_simd_write  = PIXELS_PER_SIMD_WRITE * src_bytes_per_pixel;
                 int const dest_bytes_per_simd_write = PIXELS_PER_SIMD_WRITE * bytesPerPixelDst;
@@ -517,9 +565,12 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
                         unsigned char *dest = dest_ptr;
 
                         // NOTE: Extract Pixels From Buffer
-                        __m128i src_pixels_4x          = _mm_loadu_si128((__m128i *)src_ptr);
-                        __m128i dest_pixels_4x         = _mm_loadu_si128((__m128i *)dest_ptr);
-                        __m128i src_pixels_4x_shuffled = _mm_shuffle_epi8(src_pixels_4x, src_pixels_shuffle);
+                        __m128i src_pixels_4x           = _mm_loadu_si128((__m128i *)src_ptr);
+                        __m128i dest_pixels_4x          = _mm_loadu_si128((__m128i *)dest_ptr);
+
+                        // NOTE: Arrange loaded pixels to 1 pixel per lane.
+                        __m128i src_pixels_4x_shuffled  = _mm_shuffle_epi8(src_pixels_4x, src_lanes.shuffle);
+                        __m128i dest_pixels_4x_shuffled = _mm_shuffle_epi8(dest_pixels_4x, dest_lanes.shuffle);
 
                         // NOTE: Advance Pixel Buffer
                         src_ptr += src_bytes_per_simd_write;
@@ -532,15 +583,15 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
                         //    1. Shift colour component to lowest 8 bits
                         //    2. Isolate the color component
                         //
-                        __m128i src0123_r_int = _mm_and_si128(_mm_srli_epi32(src_pixels_4x_shuffled, r_bit_shift), r_mask_4x);
-                        __m128i src0123_g_int = _mm_and_si128(_mm_srli_epi32(src_pixels_4x_shuffled, g_bit_shift), g_mask_4x);
-                        __m128i src0123_b_int = _mm_and_si128(_mm_srli_epi32(src_pixels_4x_shuffled, b_bit_shift), b_mask_4x);
-                        __m128i src0123_a_int = _mm_and_si128(_mm_srli_epi32(src_pixels_4x_shuffled, a_bit_shift), a_mask_4x);
+                        __m128i src0123_r_int = _mm_and_si128(_mm_srli_epi32(src_pixels_4x_shuffled, src_lanes.r_bit_shift), src_r_bit_mask);
+                        __m128i src0123_g_int = _mm_and_si128(_mm_srli_epi32(src_pixels_4x_shuffled, src_lanes.g_bit_shift), src_g_bit_mask);
+                        __m128i src0123_b_int = _mm_and_si128(_mm_srli_epi32(src_pixels_4x_shuffled, src_lanes.b_bit_shift), src_b_bit_mask);
+                        __m128i src0123_a_int = _mm_and_si128(_mm_srli_epi32(src_pixels_4x_shuffled, src_lanes.a_bit_shift), src_a_bit_mask);
 
-                        __m128i dest0123_r_int = _mm_and_si128(_mm_srli_epi32(dest_pixels_4x, 0), hex_0xFF_4x);
-                        __m128i dest0123_g_int = _mm_and_si128(_mm_srli_epi32(dest_pixels_4x, 8), hex_0xFF_4x);
-                        __m128i dest0123_b_int = _mm_and_si128(_mm_srli_epi32(dest_pixels_4x, 16), hex_0xFF_4x);
-                        __m128i dest0123_a_int = _mm_and_si128(_mm_srli_epi32(dest_pixels_4x, 24), hex_0xFF_4x);
+                        __m128i dest0123_r_int = _mm_and_si128(_mm_srli_epi32(dest_pixels_4x_shuffled, dest_lanes.r_bit_shift), dest_r_bit_mask);
+                        __m128i dest0123_g_int = _mm_and_si128(_mm_srli_epi32(dest_pixels_4x_shuffled, dest_lanes.g_bit_shift), dest_g_bit_mask);
+                        __m128i dest0123_b_int = _mm_and_si128(_mm_srli_epi32(dest_pixels_4x_shuffled, dest_lanes.b_bit_shift), dest_b_bit_mask);
+                        __m128i dest0123_a_int = _mm_and_si128(_mm_srli_epi32(dest_pixels_4x_shuffled, dest_lanes.a_bit_shift), dest_a_bit_mask);
 
                         // NOTE: Convert to SIMD f32x4
                         __m128 src0123_r  = _mm_cvtepi32_ps(src0123_r_int);
@@ -558,10 +609,10 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
                         __m128 dest0123_a = _mm_cvtepi32_ps(dest0123_a_int);
 
                         // NOTE: Source Pixels to Normalized [0, 1] Float Space
-                        __m128 src0123_r01 = _mm_mul_ps(src0123_r, src_r_to_01_space_coefficient);
-                        __m128 src0123_g01 = _mm_mul_ps(src0123_g, src_g_to_01_space_coefficient);
-                        __m128 src0123_b01 = _mm_mul_ps(src0123_b, src_b_to_01_space_coefficient);
-                        __m128 src0123_a01 = _mm_mul_ps(src0123_a, src_a_to_01_space_coefficient);
+                        __m128 src0123_r01 = _mm_mul_ps(src0123_r, src_r_to_01_coefficient);
+                        __m128 src0123_g01 = _mm_mul_ps(src0123_g, src_g_to_01_coefficient);
+                        __m128 src0123_b01 = _mm_mul_ps(src0123_b, src_b_to_01_coefficient);
+                        __m128 src0123_a01 = _mm_mul_ps(src0123_a, src_a_to_01_coefficient);
 
                         // NOTE: Tint Source Pixels
                         __m128 src0123_tinted_r01 = _mm_mul_ps(src0123_r01, tint_r01_4x);
@@ -570,10 +621,10 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
                         __m128 src0123_tinted_a01 = _mm_mul_ps(src0123_a01, tint_a01_4x);
 
                         // NOTE: Dest Pixels to Normalized [0, 1] Float Space
-                        __m128 dest0123_r01 = _mm_mul_ps(dest0123_r, inv_255_4x);
-                        __m128 dest0123_g01 = _mm_mul_ps(dest0123_g, inv_255_4x);
-                        __m128 dest0123_b01 = _mm_mul_ps(dest0123_b, inv_255_4x);
-                        __m128 dest0123_a01 = _mm_mul_ps(dest0123_a, inv_255_4x);
+                        __m128 dest0123_r01 = _mm_mul_ps(dest0123_r, dest_r_to_01_coefficient);
+                        __m128 dest0123_g01 = _mm_mul_ps(dest0123_g, dest_g_to_01_coefficient);
+                        __m128 dest0123_b01 = _mm_mul_ps(dest0123_b, dest_b_to_01_coefficient);
+                        __m128 dest0123_a01 = _mm_mul_ps(dest0123_a, dest_a_to_01_coefficient);
 
                         // NOTE: Porter Duff Blend
                         // NOTE: Blend Alpha
@@ -724,7 +775,8 @@ void RaylibSIMD_ImageDrawRectangleRec(Image *dst, Rectangle rec, Color color)
 
             unsigned char gray = RS_CAST(unsigned char)((r01 * 0.299f + g01 * 0.587f + b01 * 0.114f) * 255.0f);
             color_4x           = _mm_set1_epi8(gray);
-        } break;
+        }
+        break;
 
         case UNCOMPRESSED_GRAY_ALPHA:
         {
@@ -740,8 +792,8 @@ void RaylibSIMD_ImageDrawRectangleRec(Image *dst, Rectangle rec, Color color)
                                      gray, color.a,
                                      gray, color.a,
                                      gray, color.a);
-
-        } break;
+        }
+        break;
 
         case UNCOMPRESSED_R8G8B8A8:
         {
