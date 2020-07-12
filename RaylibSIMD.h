@@ -411,7 +411,15 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
         float const INV_255 = 1.f / 255.f;
         RaylibSIMD_ImageDrawMode draw_mode = RaylibSIMD_ImageDrawMode_Original;
 
-        if (dst->format == UNCOMPRESSED_R8G8B8A8 &&
+        // TODO(doyle): Other destination formats untested but algorithm has
+        // been written in a way that is agnostic of the format. Test and
+        // verify.
+        if (dst->format == UNCOMPRESSED_R8G8B8A8 ||
+            dst->format == UCOMPRESSED_R8G8B8 ||
+            dst->format == UNCOMPRESSED_R5G6B5 ||
+            dst->format == UNCOMPRESSED_R5G5B5A1 ||
+            dst->format == UNCOMPRESSED_R4G4B4A4)
+            &&
             (srcPtr->format == UNCOMPRESSED_R8G8B8A8 ||
              srcPtr->format == UNCOMPRESSED_R8G8B8 ||
              srcPtr->format == UNCOMPRESSED_R5G6B5 ||
@@ -509,18 +517,17 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
                 __m128 const tint_b01_4x      = _mm_set1_ps(tint.b * INV_255);
                 __m128 const tint_a01_4x      = _mm_set1_ps(tint.a * INV_255);
                 __m128 const one_4x           = _mm_set1_ps(1.f);
-                __m128 const u255_4x          = _mm_set1_ps(255.f);
-                __m128i const hex_0xFF_4x     = _mm_set1_epi32(0xFF);
 
-                float src_alpha_min = 0.f;
-                if (srcPtr->format == UNCOMPRESSED_R8G8B8)      src_alpha_min = 255.f;
-                else if (srcPtr->format == UNCOMPRESSED_R5G6B5) src_alpha_min = 255.f;
+                float src_alpha_min  = 0.f;
+                float dest_alpha_min = 0.f;
+                if (srcPtr->format == UNCOMPRESSED_R8G8B8 || srcPtr->format == UNCOMPRESSED_R5G6B5) src_alpha_min = 255.f;
+                if (dst->format == UNCOMPRESSED_R8G8B8 || dst->format == UNCOMPRESSED_R5G6B5)      dest_alpha_min = 255.f;
 
                 RaylibSIMD_PixelPerLaneShuffle src_lanes  = RaylibSIMD__FormatToPixelPerLaneShuffle128Bit(srcPtr->format);
                 RaylibSIMD_PixelPerLaneShuffle dest_lanes = RaylibSIMD__FormatToPixelPerLaneShuffle128Bit(dst->format);
 
                 __m128 const src_alpha_min_4x   = _mm_set1_ps(src_alpha_min);
-
+                __m128 const dest_alpha_min_4x  = _mm_set1_ps(dest_alpha_min);
                 __m128i src_r_bit_mask          = _mm_set1_epi32(src_lanes.r_bit_mask);
                 __m128i src_g_bit_mask          = _mm_set1_epi32(src_lanes.g_bit_mask);
                 __m128i src_b_bit_mask          = _mm_set1_epi32(src_lanes.b_bit_mask);
@@ -541,14 +548,21 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
                 __m128 dest_b_to_01_coefficient = _mm_set1_ps(dest_lanes.b_to_01_coefficient);
                 __m128 dest_a_to_01_coefficient = _mm_set1_ps(dest_lanes.a_to_01_coefficient);
 
+                __m128 dest_r01_to_pixel_format_coefficient = _mm_rcp_ps(dest_r_to_01_coefficient);
+                __m128 dest_g01_to_pixel_format_coefficient = _mm_rcp_ps(dest_g_to_01_coefficient);
+                __m128 dest_b01_to_pixel_format_coefficient = _mm_rcp_ps(dest_b_to_01_coefficient);
+                __m128 dest_a01_to_pixel_format_coefficient = _mm_rcp_ps(dest_a_to_01_coefficient);
+
                 // NOTE: Divide by float because we blend in [0,1] 32 bit float space
-                // Each color component requires 1 SIMD lane to perform such blend.
+                // Each color component requires 1 SIMD float lane to perform such blend.
                 int const PIXELS_PER_SIMD_WRITE = sizeof(__m128) / sizeof(float);
                 int const src_bits_per_pixel    = RaylibSIMD__FormatToBitsPerPixel(srcPtr->format);
                 int const src_bytes_per_pixel   = src_bits_per_pixel / 8;
+                int const dest_bits_per_pixel   = RaylibSIMD__FormatToBitsPerPixel(dst->format);
+                int const dest_bytes_per_pixel  = dest_bits_per_pixel / 8;
 
                 int const src_bytes_per_simd_write  = PIXELS_PER_SIMD_WRITE * src_bytes_per_pixel;
-                int const dest_bytes_per_simd_write = PIXELS_PER_SIMD_WRITE * bytesPerPixelDst;
+                int const dest_bytes_per_simd_write = PIXELS_PER_SIMD_WRITE * dest_bytes_per_pixel;
 
                 int const simd_iterations       = RS_CAST(int) srcRec.width / PIXELS_PER_SIMD_WRITE; // NOTE: Divison here rounds down fractional pixels
                 int const total_simd_pixels     = simd_iterations * PIXELS_PER_SIMD_WRITE;
@@ -599,14 +613,15 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
                         __m128 src0123_b  = _mm_cvtepi32_ps(src0123_b_int);
                         __m128 src0123_a  = _mm_cvtepi32_ps(src0123_a_int);
 
-                        // NOTE: For images without an alpha component the src_alpha_min_4x is set to 255 to completely overwrite dest.
-                        //       For images with an alpha component the src_alpha_min_4x is set to 0 (i.e. no-op)
-                        src0123_a = _mm_max_ps(src0123_a, src_alpha_min_4x);
-
                         __m128 dest0123_r = _mm_cvtepi32_ps(dest0123_r_int);
                         __m128 dest0123_g = _mm_cvtepi32_ps(dest0123_g_int);
                         __m128 dest0123_b = _mm_cvtepi32_ps(dest0123_b_int);
                         __m128 dest0123_a = _mm_cvtepi32_ps(dest0123_a_int);
+
+                        // NOTE: For images without an alpha component the src_alpha_min_4x is set to 255 to completely overwrite dest.
+                        //       For images with an alpha component the src_alpha_min_4x is set to 0 (i.e. no-op)
+                        src0123_a  = _mm_max_ps(src0123_a, src_alpha_min_4x);
+                        dest0123_a = _mm_max_ps(dest0123_a, dest_alpha_min_4x);
 
                         // NOTE: Source Pixels to Normalized [0, 1] Float Space
                         __m128 src0123_r01 = _mm_mul_ps(src0123_r, src_r_to_01_coefficient);
@@ -628,30 +643,35 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
 
                         // NOTE: Porter Duff Blend
                         // NOTE: Blend Alpha
-                        // i.e. blend_a = src_a + (dest_a * (1 - src_a))
-                        __m128 blend0123_a01     = _mm_add_ps(src0123_tinted_a01, _mm_mul_ps(dest0123_a01, _mm_sub_ps(one_4x, src0123_tinted_a01)));
-                        __m128 inv_blend0123_a01 = _mm_div_ps(one_4x, blend0123_a01);
+                        // i.e. blend_a = src_a + (dest_a * (1 - src_a)) / blend_a
+                        __m128 blend0123_a01                           = _mm_add_ps(src0123_tinted_a01, _mm_mul_ps(dest0123_a01, _mm_sub_ps(one_4x, src0123_tinted_a01)));
+                        __m128 inv_blend0123_a01                       = _mm_rcp_ps(blend0123_a01);
+
+                        // (dest_a * (1 - src a) / blend_a)
+                        __m128 one_minus_src0123_tinted_a01 = _mm_sub_ps(one_4x, src0123_tinted_a01);
+                        __m128 blend_rhs                    = _mm_mul_ps(_mm_mul_ps(dest0123_a01, _mm_mul_ps(dest0123_a01, one_minus_src0123_tinted_a01)), inv_blend0123_a01);
 
                         // NOTE: Blend Colors
                         // i.e. blend_r = ((src_r * a) + (dest_r * dest_a * (1.f - src_a))) / blend_a;
-                        __m128 blend0123_r01 = _mm_mul_ps(_mm_add_ps(_mm_mul_ps(src0123_tinted_r01, src0123_tinted_a01), _mm_mul_ps(dest0123_r01, _mm_mul_ps(dest0123_a01, _mm_sub_ps(one_4x, src0123_tinted_a01)))), inv_blend0123_a01);
-                        __m128 blend0123_g01 = _mm_mul_ps(_mm_add_ps(_mm_mul_ps(src0123_tinted_g01, src0123_tinted_a01), _mm_mul_ps(dest0123_g01, _mm_mul_ps(dest0123_a01, _mm_sub_ps(one_4x, src0123_tinted_a01)))), inv_blend0123_a01);
-                        __m128 blend0123_b01 = _mm_mul_ps(_mm_add_ps(_mm_mul_ps(src0123_tinted_b01, src0123_tinted_a01), _mm_mul_ps(dest0123_b01, _mm_mul_ps(dest0123_a01, _mm_sub_ps(one_4x, src0123_tinted_a01)))), inv_blend0123_a01);
+                        __m128 blend0123_r01 = _mm_add_ps(_mm_mul_ps(src0123_tinted_r01, src0123_tinted_a01), _mm_mul_ps(dest0123_r01, blend_rhs));
+                        __m128 blend0123_g01 = _mm_add_ps(_mm_mul_ps(src0123_tinted_g01, src0123_tinted_a01), _mm_mul_ps(dest0123_g01, blend_rhs));
+                        __m128 blend0123_b01 = _mm_add_ps(_mm_mul_ps(src0123_tinted_b01, src0123_tinted_a01), _mm_mul_ps(dest0123_b01, blend_rhs));
 
-                        // NOTE: Convert Blend to [0, 255] F32 Space
-                        __m128 blend0123_a = _mm_mul_ps(blend0123_a01, u255_4x);
-                        __m128 blend0123_r = _mm_mul_ps(blend0123_r01, u255_4x);
-                        __m128 blend0123_g = _mm_mul_ps(blend0123_g01, u255_4x);
-                        __m128 blend0123_b = _mm_mul_ps(blend0123_b01, u255_4x);
+                        // NOTE: Convert Blend to F32 Space for Pixel Format
+                        // i.e. For RGBA8888 to [0-255], RGBA4444 to [0-16] .. etc.
+                        __m128 blend0123_a = _mm_mul_ps(blend0123_a01, dest_a01_to_pixel_format_coefficient);
+                        __m128 blend0123_r = _mm_mul_ps(blend0123_r01, dest_r01_to_pixel_format_coefficient);
+                        __m128 blend0123_g = _mm_mul_ps(blend0123_g01, dest_g01_to_pixel_format_coefficient);
+                        __m128 blend0123_b = _mm_mul_ps(blend0123_b01, dest_b01_to_pixel_format_coefficient);
 
-                        // NOTE: Convert Blend to [0, 255] Integer Space
+                        // NOTE: Convert Blend to Integer Space
                         __m128i blended0123_a_int = _mm_cvtps_epi32(blend0123_a);
                         __m128i blended0123_r_int = _mm_cvtps_epi32(blend0123_r);
                         __m128i blended0123_g_int = _mm_cvtps_epi32(blend0123_g);
                         __m128i blended0123_b_int = _mm_cvtps_epi32(blend0123_b);
 
                         // NOTE: Repack The Pixel
-                        // From {RRRR} {GGGG} {BBBB} {AAAA} to {ABGR ABGR ABGR ABGR}
+                        // From {RRRR} {GGGG} {BBBB} {AAAA} to target format, i.e. for RGBA8888 {ABGR ABGR ABGR ABGR}
                         // Each blend has the color component converted to 8 bits sitting in the low bits of the SIMD lane.
                         // Shift the colors into place and or them together to get the final output
                         //
@@ -661,11 +681,15 @@ void RaylibSIMD_ImageDraw(Image *dst, Image src, Rectangle srcRec, Rectangle dst
                         //      blended0123_b_int = {[0,0,0,A], [0,0,0,A], [0,0,0,A], [0,0,0,A]}
                         //      pixel0123         = {[A,B,G,R], [A,B,G,R], [A,B,G,R], [A,B,G,R]}
                         //
-                        __m128i pixel0123 =
-                            _mm_or_si128(blended0123_r_int,
-                                         _mm_or_si128(_mm_or_si128(_mm_slli_epi32(blended0123_g_int, 8),
-                                                                   _mm_slli_epi32(blended0123_b_int, 16)),
-                                                      _mm_slli_epi32(blended0123_a_int, 24)));
+
+                        __m128i blended0123_a_int_shifted = _mm_slli_epi32(blended0123_a_int, dest_lanes.a_bit_shift);
+                        __m128i blended0123_r_int_shifted = _mm_slli_epi32(blended0123_r_int, dest_lanes.r_bit_shift);
+                        __m128i blended0123_g_int_shifted = _mm_slli_epi32(blended0123_g_int, dest_lanes.g_bit_shift);
+                        __m128i blended0123_b_int_shifted = _mm_slli_epi32(blended0123_b_int, dest_lanes.b_bit_shift);
+
+                        __m128i pixel0123_ar = _mm_or_si128(blended0123_a_int_shifted, blended0123_r_int_shifted);
+                        __m128i pixel0123_gb = _mm_or_si128(blended0123_g_int_shifted, blended0123_b_int_shifted);
+                        __m128i pixel0123    = _mm_or_si128(pixel0123_ar, pixel0123_gb);
                         _mm_storeu_si128((__m128i *)dest, pixel0123);
                     }
 
@@ -864,7 +888,7 @@ void RaylibSIMD_ImageDrawRectangleRec(Image *dst, Rectangle rec, Color color)
     int const pixels_per_simd_write = sizeof(__m128i) / bytes_per_pixel;
     int const bytes_per_simd_write  = pixels_per_simd_write * bytes_per_pixel;
 
-    int const simd_iterations       = RS_CAST(int)(rec.width * bytes_per_pixel) / sizeof(__m128i);
+    int const simd_iterations       = RS_CAST(int)rec.width / pixels_per_simd_write;
     int const remaining_iterations  = rec.width - (pixels_per_simd_write * simd_iterations);
 
     int const stride                = dst->width * bytes_per_pixel;
